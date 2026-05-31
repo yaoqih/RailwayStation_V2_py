@@ -61,49 +61,12 @@ cp /Users/huyaoqi/Documents/train_cal/PointToArea/RailwayStation_V2.Console/Data
 然后执行：
 
 ```bash
-python - <<'PY'
-import json
-from pathlib import Path
-
-from railwaystation import BackwardConstructionAlgorithm, DataProvider, Terminal
-
-case_path = Path("/Users/huyaoqi/Documents/train_cal/PointToArea/RailwayStation_V2_py/2025-09-04-noon.run.xlsx")
-map_path = Path("/Users/huyaoqi/Documents/train_cal/PointToArea/RailwayStation_V2_py/map.xlsx")
-output_path = Path("/Users/huyaoqi/Documents/train_cal/PointToArea/RailwayStation_V2_py/result_2025-09-04-noon_python.json")
-
-# 第一步：补 Start_with_end
-Terminal.add_end_position_to_start_sheet(str(case_path))
-
-# 第二步：生成 End_generated
-Terminal.generate_end_sheet(str(case_path))
-
-# 第三步：正式求解
-distance_matrix, track_line_capacity = DataProvider.get_map_info(str(map_path))
-track_lines = DataProvider.init_track_lines(track_line_capacity)
-cars = DataProvider.init_cars(track_lines, str(case_path))
-operations = BackwardConstructionAlgorithm(track_lines, cars, distance_matrix).run()
-
-payload = [
-    {
-        "Index": op.index,
-        "LineName": op.line_name,
-        "Action": op.action.value,
-        "MoveCars": [car.no for car in op.move_cars],
-        "TrainCars": [car.no for car in op.train_cars],
-        "LineCarsBefore": [car.no for car in op.line_cars_before],
-        "LineCarsAfter": [car.no for car in op.line_cars_after],
-    }
-    for op in operations
-]
-
-output_path.write_text(
-    json.dumps(payload, ensure_ascii=False, indent=2),
-    encoding="utf-8",
-)
-
-print(f"生成操作数: {len(operations)}")
-print(f"结果文件: {output_path}")
-PY
+python run_excel_case.py \
+  --file /Users/huyaoqi/Documents/train_cal/PointToArea/RailwayStation_V2_py/2025-09-04-noon.run.xlsx \
+  --map /Users/huyaoqi/Documents/train_cal/PointToArea/RailwayStation_V2_py/map.xlsx \
+  --output /Users/huyaoqi/Documents/train_cal/PointToArea/RailwayStation_V2_py/result_2025-09-04-noon_python.json \
+  --prepare-terminal \
+  --apply-csharp-export-postprocess
 ```
 
 ## 5. 这段代码实际做了什么
@@ -128,7 +91,30 @@ PY
 
 这个 sheet 是 Python 终点分配器生成的“程序实际使用的终点表”。
 
-### 5.3 `DataProvider.init_cars(...)`
+### 5.3 `run_excel_case.py`
+
+这个脚本现在已经落到仓库里了：
+
+- [run_excel_case.py](/Users/huyaoqi/Documents/train_cal/PointToArea/RailwayStation_V2_py/run_excel_case.py)
+
+它会按当前 Python 代码链路做三件事：
+
+1. 可选地生成 `Start_with_end`
+2. 可选地生成 `End_generated`
+3. 读取 `Start` + `End_generated` 正式求解
+
+如果加了：
+
+- `--apply-csharp-export-postprocess`
+
+它还会额外套一层和 C# Console 一样的导出后处理：
+
+- `TrainCars.Reverse()`
+- `Put` 动作的 `MoveCars.Reverse()`
+
+这样生成出来的 JSON 更接近 C# Console 的结果表示层。
+
+### 5.4 `DataProvider.init_cars(...)`
 
 正式求解时，它不是读 `End`，而是读：
 
@@ -198,13 +184,14 @@ PY
 
 ## 9. 如果你想批量跑多个 Excel
 
-当前仓库里没有现成批量 CLI。
+当前仓库里已经有单文件 CLI：
 
-最简单的方法是把上面的单文件脚本外面再包一层 `for` 循环，逐个处理。
+- [run_excel_case.py](/Users/huyaoqi/Documents/train_cal/PointToArea/RailwayStation_V2_py/run_excel_case.py)
+
+如果要批量跑，最简单的方法是对它外面再包一层 `for` 循环，逐个处理。
 
 如果你需要，我可以下一步直接给你补一个真正可用的 Python CLI，例如：
 
-- `python run_excel_case.py --file ... --map ...`
 - `python run_excel_case.py --all --data-dir ...`
 
-这样后面就不用每次手写 heredoc 了。
+这样后面就能直接按目录批量跑。

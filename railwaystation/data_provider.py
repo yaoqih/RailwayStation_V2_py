@@ -5,7 +5,8 @@ from pathlib import Path
 
 from openpyxl import load_workbook
 
-from .core import Car, FileTrackName, TrackLine, TrackLineName
+from .core import Car, TrackLine, TrackLineName
+from .terminal_forced_position_mapper import TerminalForcedPositionMapper
 
 
 class DataProvider:
@@ -31,42 +32,58 @@ class DataProvider:
 
     @staticmethod
     def init_for_terminal(path: str) -> tuple[dict[str, TrackLine], dict[str, Car]]:
-        track_lines = {line.value: TrackLine(name=line.value) for line in FileTrackName}
+        from .terminal import Terminal
+
+        track_lines = {line.value: TrackLine(name=line.value) for line in TrackLineName if line != TrackLineName.train}
         cars: dict[str, Car] = {}
         workbook = load_workbook(path)
         sheet = DataProvider.get_sheet(workbook, "Start_with_end")
         target_line_column = DataProvider.get_column_index(sheet, "末尾位置")
         if target_line_column <= 0:
             target_line_column = sheet.max_column
-        fixed_target_position_column = DataProvider.get_column_index(sheet, "终点台位")
         force_target_position_column = DataProvider.get_column_index(sheet, "强制对位")
+        closed_door_column = DataProvider.get_column_index(sheet, "关门车")
         for idx, row in enumerate(sheet.iter_rows(values_only=True), start=0):
             if idx == 0:
                 continue
             if DataProvider.is_effectively_empty_row(row):
                 continue
-            original_track_name = str(DataProvider.get_row_value(row, 0) or "")
+            original_track_name = Terminal.normalize_track_name_for_distance(str(DataProvider.get_row_value(row, 0) or "").strip())
             cell_type = str(DataProvider.get_row_value(row, 2) or "")
             if not cell_type:
                 continue
             force_raw = DataProvider.get_row_value(row, force_target_position_column - 1) if force_target_position_column > 0 else None
-            is_force_target_position = DataProvider.parse_force_flag(force_raw)
-            fixed_target_line_position = -1
-            if is_force_target_position and fixed_target_position_column > 0:
-                fixed_target_line_position = int(DataProvider.get_row_value(row, fixed_target_position_column - 1) or 0)
+            force_target_position_text = "" if force_raw is None else str(force_raw).strip()
             target_line_name = str(DataProvider.get_row_value(row, target_line_column - 1) or "") if target_line_column > 0 else ""
+            possible_target_line_names = DataProvider.parse_possible_target_line_names(target_line_name)
+            selected_target_line_name = ""
+            target_min_position = 0
+            target_max_position = -1
+            if len(possible_target_line_names) == 1:
+                selected_target_line_name, target_min_position, target_max_position = Terminal.resolve_target_segment(possible_target_line_names[0])
+            closed_door_raw = DataProvider.get_row_value(row, closed_door_column - 1) if closed_door_column > 0 else None
             car = Car(
                 type=cell_type,
                 no=str(DataProvider.get_row_value(row, 3) or ""),
                 origin_line_name=original_track_name,
                 origin_line_position=int(DataProvider.get_row_value(row, 1) or 0),
-                target_line_name=target_line_name,
-                is_force_target_position=is_force_target_position,
-                fixed_target_line_position=fixed_target_line_position,
-                target_line_position=fixed_target_line_position if is_force_target_position else -1,
+                target_line_name=selected_target_line_name,
+                possible_target_line_names=possible_target_line_names,
+                target_min_position=target_min_position,
+                target_max_position=target_max_position,
+                force_target_position_text=force_target_position_text,
+                is_closed_door=DataProvider.parse_force_flag(closed_door_raw),
+                is_force_target_position=False,
+                fixed_target_line_position=-1,
+                target_line_position=-1,
             )
+            if len(possible_target_line_names) == 1:
+                TerminalForcedPositionMapper.apply_to_car(car, possible_target_line_names[0])
             cars[car.no] = car
-            track_lines[original_track_name].unshift_current(car)
+            origin_track_line = track_lines.get(original_track_name)
+            if origin_track_line is None:
+                raise RuntimeError(f"Start_with_end 中存在无法识别的起始股道：{original_track_name}，车号={car.no}")
+            origin_track_line.unshift_current(car)
         return track_lines, cars
 
     @staticmethod
@@ -83,6 +100,7 @@ class DataProvider:
         cars: dict[str, Car] = {}
         workbook = load_workbook(path)
         sheet_start = DataProvider.get_sheet(workbook, "Start")
+        closed_door_column = DataProvider.get_column_index(sheet_start, "关门车")
         for idx, row in enumerate(sheet_start.iter_rows(values_only=True), start=0):
             if idx == 0:
                 continue
@@ -102,6 +120,9 @@ class DataProvider:
                 origin_line_position=int(DataProvider.get_row_value(row, 1) or 0),
                 is_heavy=str(DataProvider.get_row_value(row, 4) or "") == "重",
                 is_weigh=int(DataProvider.get_row_value(row, 6) or 0) == 1,
+                is_closed_door=DataProvider.parse_force_flag(
+                    DataProvider.get_row_value(row, closed_door_column - 1) if closed_door_column > 0 else None
+                ),
             )
             cars[car.no] = car
             track_line.unshift_current(car)
@@ -191,7 +212,20 @@ class DataProvider:
         if value is None:
             return False
         normalized = str(value).strip()
-        return normalized in {"1", "true", "True", "yes", "Yes", "y", "Y"}
+        return normalized in {"1", "是", "true", "True", "yes", "Yes", "y", "Y"}
+
+    @staticmethod
+    def parse_possible_target_line_names(raw_target_line_name: str) -> list[str]:
+        if not raw_target_line_name or not raw_target_line_name.strip():
+            return []
+        return [
+            item
+            for item in dict.fromkeys(
+                part.strip()
+                for part in raw_target_line_name.split(",")
+                if part.strip() and part.strip() != "未找到"
+            )
+        ]
 
     GetRowValue = get_row_value
     IsEffectivelyEmptyRow = is_effectively_empty_row
@@ -203,3 +237,4 @@ class DataProvider:
     GetMapInfo = get_map_info
     GetColumnIndex = get_column_index
     ParseForceFlag = parse_force_flag
+    ParsePossibleTargetLineNames = parse_possible_target_line_names

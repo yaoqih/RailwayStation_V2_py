@@ -29,10 +29,13 @@ class TerminalContext:
         for car in car_dict.values():
             car.target_line_position = car.fixed_target_line_position if car.is_force_target_position else -1
         start_position_dict: dict[str, int] = {}
+        from .terminal import Terminal
+
         for row in sheet.iter_rows(min_row=2, values_only=True):
             track_name = str(row[0] or "").strip()
             position = int(row[1] or 0)
-            start_position_dict[track_name] = position
+            normalized_name = Terminal.normalize_track_name_for_distance(track_name)
+            start_position_dict[normalized_name] = max(start_position_dict.get(normalized_name, 0), position)
         return cls(
             distance_matrix=distance_matrix,
             track_lines=track_line_dict,

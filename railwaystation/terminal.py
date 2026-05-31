@@ -10,6 +10,9 @@ from openpyxl.styles import Alignment
 from .core import Car, CarGroup, TrackLine
 from .data_provider import DataProvider
 from .io import TerminalContext
+from .standard_converter import StandardCaseConverter
+from .terminal_strategies import SolverBlindSpotAvoidanceTerminalStrategy
+from .terminal_strategy_runner import TerminalStrategyRunner
 
 
 @dataclass
@@ -50,6 +53,10 @@ class GroupPlacementPlan:
 
 class Terminal:
     max_continuous_chunk_size = 5
+    repair_outer_start_position = 1
+    repair_outer_capacity = 4
+    repair_inner_start_position = 5
+    repair_inner_capacity = 5
 
     @staticmethod
     def _display_width(value) -> int:
@@ -85,12 +92,54 @@ class Terminal:
 
     @staticmethod
     def generate_end_sheet(file_path: str) -> None:
-        context = TerminalContext.build_terminal_context(file_path)
-        global_dict = Terminal.build_global_dict(context.track_lines)
-        if Terminal.assign_position_direct(global_dict, context):
+        standardized_path = Terminal.prepare_standardized_case(file_path)
+        Terminal.ensure_start_with_end_sheet(str(standardized_path))
+        context = TerminalContext.build_terminal_context(str(standardized_path))
+        distance_matrix = context.distance_matrix
+        track_line_capacity = context.track_line_capacity
+        best_result = TerminalStrategyRunner.find_best_solve(
+            str(standardized_path),
+            distance_matrix,
+            track_line_capacity,
+        )
+        context = best_result.context
+        if True:
             Terminal.testCar(context)
-            Terminal.copy_source_file(file_path)
-            Terminal.output_file(file_path, context)
+            Terminal.copy_source_file(str(standardized_path))
+            Terminal.output_file(str(standardized_path), context)
+
+    @staticmethod
+    def prepare_standardized_case(file_path: str) -> Path:
+        return StandardCaseConverter.convert_case(file_path)
+
+    @staticmethod
+    def ensure_start_with_end_sheet(file_path: str) -> None:
+        workbook = load_workbook(file_path)
+        need_rebuild = True
+        if "Start_with_end" in workbook.sheetnames:
+            sheet = workbook["Start_with_end"]
+            need_rebuild = not Terminal._has_valid_header(sheet)
+        workbook.close()
+        if need_rebuild:
+            Terminal.add_end_position_to_start_sheet(file_path)
+
+    @staticmethod
+    def _has_valid_header(sheet) -> bool:
+        headers = []
+        for cell in sheet[1]:
+            value = str(cell.value or "").strip()
+            if value:
+                headers.append(value)
+        required = {"股道", "序号", "车型", "车号", "末尾位置", "强制对位"}
+        return required.issubset(set(headers))
+
+    @staticmethod
+    def _find_header_row(sheet) -> int:
+        for row in sheet.iter_rows():
+            headers = [str(cell.value or "").strip() for cell in row if str(cell.value or "").strip()]
+            if {"股道", "序号", "车型", "车号"}.issubset(set(headers)):
+                return row[0].row
+        raise RuntimeError(f"工作表 {sheet.title} 中未找到表头行")
 
     @staticmethod
     def testCar(context: TerminalContext) -> None:
@@ -150,48 +199,58 @@ class Terminal:
     def add_end_position_to_start_sheet(filepath: str) -> None:
         workbook = load_workbook(filepath)
         start_sheet = DataProvider.get_sheet(workbook, "Start")
+        # V3 的 AddEndPositionToStartSheet 依赖终点模板语义，而不是上一次运行后可能被污染的 End_generated。
+        # 这里优先使用稳定的 End 工作表，避免把半成品回写成新的 Start_with_end。
         end_sheet = DataProvider.get_sheet(workbook, "End")
+        start_header_row = Terminal._find_header_row(start_sheet)
+        end_header_row = Terminal._find_header_row(end_sheet)
         end_force_column = 0
         end_sequence_column = 2
+        end_line_column = 1
+        end_car_no_column = 4
         end_last_col = Terminal._last_used_column(end_sheet)
         for col in range(1, end_last_col + 1):
-            header = str(end_sheet.cell(1, col).value or "").strip()
+            header = str(end_sheet.cell(end_header_row, col).value or "").strip()
             if header == "强制对位":
                 end_force_column = col
             elif header == "序号":
                 end_sequence_column = col
+            elif header == "股道":
+                end_line_column = col
+            elif header == "车号":
+                end_car_no_column = col
         end_position_dict: dict[str, str] = {}
         end_target_position_dict: dict[str, str] = {}
-        end_force_dict: dict[str, str] = {}
-        for row in [row for row in Terminal._used_row_numbers(end_sheet) if row >= 2]:
-            line_name = str(end_sheet.cell(row, 1).value or "").strip()
+        for row in [row for row in Terminal._used_row_numbers(end_sheet) if row > end_header_row]:
+            line_name = str(end_sheet.cell(row, end_line_column).value or "").strip()
             position = str(end_sheet.cell(row, end_sequence_column).value or "").strip()
-            car_no = str(end_sheet.cell(row, 4).value or "").strip()
-            force_flag = str(end_sheet.cell(row, end_force_column).value or "0").strip() if end_force_column > 0 else "0"
+            car_no = str(end_sheet.cell(row, end_car_no_column).value or "").strip()
             if not car_no:
                 continue
-            end_position_dict[car_no] = line_name
+            end_position_dict[car_no] = Terminal.map_end_line_name_by_position(line_name, position)
             end_target_position_dict[car_no] = position
-            end_force_dict[car_no] = force_flag
         if "Start_with_end" in workbook.sheetnames:
             del workbook["Start_with_end"]
         new_sheet = workbook.create_sheet("Start_with_end")
         last_col = Terminal._last_used_column(start_sheet)
         for col in range(1, last_col + 1):
-            new_sheet.cell(1, col).value = start_sheet.cell(1, col).value
+            new_sheet.cell(1, col).value = start_sheet.cell(start_header_row, col).value
         new_col = last_col + 1
         new_sheet.cell(1, new_col).value = "末尾位置"
-        new_sheet.cell(1, new_col + 1).value = "终点台位"
-        new_sheet.cell(1, new_col + 2).value = "强制对位"
+        new_sheet.cell(1, new_col + 1).value = "强制对位"
+        start_car_no_column = 4
+        for col in range(1, last_col + 1):
+            header = str(start_sheet.cell(start_header_row, col).value or "").strip()
+            if header == "车号":
+                start_car_no_column = col
+                break
         new_row_index = 2
-        for row in [row for row in Terminal._used_row_numbers(start_sheet) if row >= 2]:
+        for row in [row for row in Terminal._used_row_numbers(start_sheet) if row > start_header_row]:
             for col in range(1, last_col + 1):
                 new_sheet.cell(new_row_index, col).value = start_sheet.cell(row, col).value
-            car_no = str(start_sheet.cell(row, 4).value or "").strip()
+            car_no = str(start_sheet.cell(row, start_car_no_column).value or "").strip()
             new_sheet.cell(new_row_index, new_col).value = end_position_dict.get(car_no, "未找到")
-            if car_no in end_target_position_dict:
-                new_sheet.cell(new_row_index, new_col + 1).value = end_target_position_dict[car_no]
-            new_sheet.cell(new_row_index, new_col + 2).value = end_force_dict.get(car_no, "0")
+            new_sheet.cell(new_row_index, new_col + 1).value = end_target_position_dict.get(car_no, "0")
             new_row_index += 1
         for column_cells in new_sheet.columns:
             column_letter = column_cells[0].column_letter
@@ -420,6 +479,35 @@ class Terminal:
         return result[:remain_count]
 
     @staticmethod
+    def resolve_group_segment(cars: list[Car], line_max_position: int) -> tuple[int, int]:
+        min_candidates = [car.target_min_position for car in cars if car.target_min_position > 0]
+        max_candidates = [car.target_max_position for car in cars if car.target_max_position > 0]
+        min_position = max(min_candidates) if min_candidates else 1
+        max_position = min(min(max_candidates), line_max_position) if max_candidates else line_max_position
+        return min_position, max_position
+
+    @staticmethod
+    def get_source_priority(source_line_name: str, use_normalized: bool = False) -> int:
+        priority_key = Terminal.normalize_track_name_for_distance(source_line_name) if use_normalized else source_line_name
+        if not priority_key:
+            return 9
+        if priority_key in {"洗罐", "喷漆"}:
+            return 0
+        if priority_key == "卸轮线":
+            return 1
+        if priority_key.startswith("修"):
+            return 1
+        if priority_key == "机走":
+            return 2
+        if priority_key in {"机库线", "调梁"}:
+            return 3
+        if priority_key == "老预修":
+            return 5
+        if priority_key.startswith("存"):
+            return 6
+        return 4
+
+    @staticmethod
     def build_placement_groups(source_groups: dict[str, list[CarGroup]], context: TerminalContext, target_line_name: str) -> list[PlacementGroup]:
         raw_groups = []
         for source in source_groups.values():
@@ -533,6 +621,120 @@ class Terminal:
         return mapping.get(name, name)
 
     @staticmethod
+    def map_end_line_name_by_position(line_name: str, position_text: str) -> str:
+        line_name = line_name.strip()
+        try:
+            position = int(position_text.strip())
+        except Exception:
+            return line_name
+        mapping = {
+            "老预修": "预修线",
+            "机库线": "机库线",
+            "卸轮线": "卸轮线",
+            "喷漆": "油漆线",
+            "存1线": "存1线",
+            "存2线": "存2线",
+            "存3线": "存3线",
+            "存4线": "存4线",
+            "抛丸线": "抛丸线",
+        }
+        if line_name in mapping:
+            return mapping[line_name]
+        if line_name == "机走":
+            return "机走棚" if position >= 7 else "机走北"
+        if line_name == "调梁":
+            return "调梁棚" if position >= 7 else "调梁线北"
+        if line_name in {"修1", "修2", "修3", "修4"}:
+            return f"{line_name}库内" if position >= 5 else f"{line_name}库外"
+        if line_name == "存5线":
+            return "存5线南" if position >= 22 else "存5线北"
+        if line_name == "洗罐":
+            return "洗罐站" if position >= 9 else "洗罐线北"
+        return line_name
+
+    @staticmethod
+    def resolve_target_segment(raw_end_position: str) -> tuple[str, int, int]:
+        raw = raw_end_position.strip()
+        outer_start = Terminal.repair_outer_start_position
+        outer_end = outer_start + Terminal.repair_outer_capacity - 1
+        inner_start = Terminal.repair_inner_start_position
+        inner_end = inner_start + Terminal.repair_inner_capacity - 1
+        mapping = {
+            "预修": ("老预修", 1, 14),
+            "老预修": ("老预修", 1, 14),
+            "预修线": ("老预修", 1, 14),
+            "机库线": ("机库线", 1, 5),
+            "机库": ("机库线", 1, 5),
+            "机北3": ("机走", 1, 6),
+            "机走北": ("机走", 1, 6),
+            "机棚": ("机走", 7, 14),
+            "机走棚": ("机走", 7, 14),
+            "机走": ("机走", 1, 14),
+            "机走预修": ("机走", 1, 14),
+            "调北": ("调梁", 1, 6),
+            "调梁线北": ("调梁", 1, 6),
+            "调棚": ("调梁", 7, 17),
+            "调梁棚": ("调梁", 7, 17),
+            "调梁": ("调梁", 1, 17),
+            "调梁库": ("调梁", 1, 17),
+            "调梁库外": ("调梁", 1, 6),
+            "调梁库内": ("调梁", 7, 17),
+            "修1库外": ("修1", outer_start, outer_end),
+            "修1": ("修1", inner_start, inner_end),
+            "修1库内": ("修1", inner_start, inner_end),
+            "修2库外": ("修2", outer_start, outer_end),
+            "修2": ("修2", inner_start, inner_end),
+            "修2库内": ("修2", inner_start, inner_end),
+            "修3库外": ("修3", outer_start, outer_end),
+            "修3": ("修3", inner_start, inner_end),
+            "修3库内": ("修3", inner_start, inner_end),
+            "修4库外": ("修4", outer_start, outer_end),
+            "修4": ("修4", inner_start, inner_end),
+            "修4库内": ("修4", inner_start, inner_end),
+            "轮": ("卸轮线", 1, 4),
+            "卸轮线": ("卸轮线", 1, 4),
+            "漆": ("喷漆", 1, 9),
+            "喷漆": ("喷漆", 1, 9),
+            "喷漆库": ("喷漆", 1, 9),
+            "喷漆库外": ("喷漆", 1, 3),
+            "喷漆库内": ("喷漆", 4, 9),
+            "油": ("喷漆", 1, 9),
+            "油漆": ("喷漆", 1, 9),
+            "油漆线": ("喷漆", 1, 9),
+            "油漆库": ("喷漆", 1, 9),
+            "油漆库外": ("喷漆", 1, 3),
+            "油漆库内": ("喷漆", 1, 9),
+            "存1": ("存1线", 1, 9),
+            "存1线": ("存1线", 1, 9),
+            "存2": ("存2线", 1, 20),
+            "存2线": ("存2线", 1, 20),
+            "存3": ("存3线", 1, 21),
+            "存3线": ("存3线", 1, 21),
+            "存4": ("存4线", 1, 25),
+            "存4线": ("存4线", 1, 25),
+            "存4北": ("存4线", 1, 25),
+            "存5北": ("存5线", 1, 21),
+            "存5线北": ("存5线", 1, 21),
+            "存5南": ("存5线", 22, 33),
+            "存5线南": ("存5线", 22, 33),
+            "存5": ("存5线", 1, 33),
+            "存5线": ("存5线", 1, 33),
+            "抛": ("抛丸线", 1, 3),
+            "抛丸线": ("抛丸线", 1, 3),
+            "洗北": ("洗罐", 1, 8),
+            "洗罐线北": ("洗罐", 1, 8),
+            "洗南": ("洗罐", 9, 15),
+            "洗罐站": ("洗罐", 9, 15),
+            "洗罐": ("洗罐", 1, 15),
+            "洗罐线": ("洗罐", 1, 15),
+            "洗罐线外": ("洗罐", 1, 8),
+            "洗罐库外": ("洗罐", 1, 8),
+            "洗罐线内": ("洗罐", 9, 15),
+            "洗罐库内": ("洗罐", 9, 15),
+        }
+        return mapping.get(raw, (raw, 1, 2**31 - 1))
+
+    @staticmethod
     def ease_key(group: PlacementGroup) -> tuple:
         return (
             group.is_same_line,
@@ -592,7 +794,11 @@ class Terminal:
     CreatePlacementGroup = create_placement_group
     SplitPlacementGroup = split_placement_group
     GetDistance = get_distance
+    GetSourcePriority = get_source_priority
     NormalizeTrackNameForDistance = normalize_track_name_for_distance
+    MapEndLineNameByPosition = map_end_line_name_by_position
+    ResolveTargetSegment = resolve_target_segment
+    ResolveGroupSegment = resolve_group_segment
     Compare = compare
     GetCandidateTracks = get_candidate_tracks
     GetExactCapacityForTargetType = get_exact_capacity_for_target_type

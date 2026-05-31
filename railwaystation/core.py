@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import Enum
@@ -92,6 +94,29 @@ class Constraint:
     IsOverTrainCountLimit = is_over_train_count_limit
 
 
+TRACE_ENABLED = os.environ.get("RAILWAY_TRACE", "") == "1"
+TRACE_ROUNDS = {
+    int(item)
+    for item in os.environ.get("RAILWAY_TRACE_ROUNDS", "").split(",")
+    if item.strip().isdigit()
+}
+
+
+def _trace_enabled(round_idx: int | None = None) -> bool:
+    if not TRACE_ENABLED:
+        return False
+    if not TRACE_ROUNDS:
+        return True
+    if round_idx is None:
+        return True
+    return round_idx in TRACE_ROUNDS
+
+
+def _trace(message: str, round_idx: int | None = None) -> None:
+    if _trace_enabled(round_idx):
+        print(f"[TRACE]{'' if round_idx is None else f'[R{round_idx}]'} {message}")
+
+
 @dataclass(eq=False)
 class Car:
     no: str = ""
@@ -101,12 +126,18 @@ class Car:
     origin_line_name: str = ""
     origin_line_name_second: str = ""
     origin_line_position: int = 0
+    possible_target_line_names: list[str] = field(default_factory=list)
+    target_min_position: int = 0
+    target_max_position: int = -1
     target_line_id: int = 0
     target_line_name: str = ""
     target_line_name_second: str = ""
     target_line_position: int = 0
     is_force_target_position: bool = False
     fixed_target_line_position: int = -1
+    force_target_position_text: str = ""
+    allowed_target_line_positions: list[int] = field(default_factory=list)
+    is_closed_door: bool = False
     is_heavy: bool = False
     is_weigh: bool = False
     is_weighed: bool = False
@@ -249,12 +280,18 @@ class Car:
     OriginLineName = property(lambda self: self.origin_line_name, lambda self, value: setattr(self, "origin_line_name", value))
     OriginLineName_Second = property(lambda self: self.origin_line_name_second, lambda self, value: setattr(self, "origin_line_name_second", value))
     OriginLinePosition = property(lambda self: self.origin_line_position, lambda self, value: setattr(self, "origin_line_position", value))
+    PossibleTargetLineNames = property(lambda self: self.possible_target_line_names, lambda self, value: setattr(self, "possible_target_line_names", value))
+    TargetMinPosition = property(lambda self: self.target_min_position, lambda self, value: setattr(self, "target_min_position", value))
+    TargetMaxPosition = property(lambda self: self.target_max_position, lambda self, value: setattr(self, "target_max_position", value))
     TargetLineId = property(lambda self: self.target_line_id, lambda self, value: setattr(self, "target_line_id", value))
     TargetLineName = property(lambda self: self.target_line_name, lambda self, value: setattr(self, "target_line_name", value))
     TargetLineName_Second = property(lambda self: self.target_line_name_second, lambda self, value: setattr(self, "target_line_name_second", value))
     TargetLinePosition = property(lambda self: self.target_line_position, lambda self, value: setattr(self, "target_line_position", value))
     IsForceTargetPosition = property(lambda self: self.is_force_target_position, lambda self, value: setattr(self, "is_force_target_position", value))
     FixedTargetLinePosition = property(lambda self: self.fixed_target_line_position, lambda self, value: setattr(self, "fixed_target_line_position", value))
+    ForceTargetPositionText = property(lambda self: self.force_target_position_text, lambda self, value: setattr(self, "force_target_position_text", value))
+    AllowedTargetLinePositions = property(lambda self: self.allowed_target_line_positions, lambda self, value: setattr(self, "allowed_target_line_positions", value))
+    IsClosedDoor = property(lambda self: self.is_closed_door, lambda self, value: setattr(self, "is_closed_door", value))
     IsHeavy = property(lambda self: self.is_heavy, lambda self, value: setattr(self, "is_heavy", value))
     IsWeigh = property(lambda self: self.is_weigh, lambda self, value: setattr(self, "is_weigh", value))
     IsWeighed = property(lambda self: self.is_weighed, lambda self, value: setattr(self, "is_weighed", value))
@@ -303,7 +340,8 @@ class TrackLine:
 
     @property
     def cache_usable_capacity(self) -> Decimal:
-        return max(self.rem_capacity - self.cache_reserved_capacity, Decimal("0"))
+        result = self.rem_capacity - self.cache_reserved_capacity
+        return result if result > 0 else Decimal("0")
 
     @property
     def current_top_car(self) -> Car | None:
@@ -513,6 +551,10 @@ class CarGroup:
 @dataclass(eq=False)
 class Train(TrackLine):
     @property
+    def current_list_count(self) -> int:
+        return len(self.current_list)
+
+    @property
     def wanted_car(self) -> Car | None:
         return self.current_top_car.next_target_car if self.current_top_car else None
 
@@ -566,6 +608,7 @@ class Train(TrackLine):
             )
         )
 
+    CurrentListCount = property(lambda self: self.current_list_count)
     WantedCar = property(lambda self: self.wanted_car)
     IsContainAllLineTarget = is_contain_all_line_target
     GetNotContainTargetCars = get_not_contain_target_cars
@@ -633,6 +676,11 @@ class Actions:
     def move_car_from_line_to_train_continuously(car: Car, train: Train, operation: Operation) -> None:
         current_line = car.current_line
         target_line = car.target_line
+        _trace(
+            "continuous_get start "
+            f"seed={car.no} line={current_line.name} target={target_line.name} "
+            f"target_top={(target_line.target_top_car.no if target_line.target_top_car else None)}",
+        )
         Actions.move_car_from_line_to_train(car, train, True)
         operation.move_cars.append(car)
         while (
@@ -643,8 +691,19 @@ class Actions:
             and not Constraint.is_over_train_count_limit(train, [current_line.current_top_car])
         ):
             tmp = current_line.current_top_car
+            _trace(
+                "continuous_get extend "
+                f"next={tmp.no} next_target_pos={tmp.target_line_position} "
+                f"target_top={(target_line.target_top_car.no if target_line.target_top_car else None)}:"
+                f"{(target_line.target_top_car.target_line_position if target_line.target_top_car else None)}",
+            )
             Actions.move_car_from_line_to_train(tmp, train, True)
             operation.move_cars.append(tmp)
+        _trace(
+            "continuous_get end "
+            f"cars={[item.no for item in operation.move_cars]} "
+            f"remaining_top={(current_line.current_top_car.no if current_line.current_top_car else None)}",
+        )
 
     @staticmethod
     def move_car_from_line_to_train(car: Car, train: Train, is_remove_from_target: bool) -> None:
@@ -872,13 +931,28 @@ class OperationManager:
 
     def add(self, operation: Operation) -> None:
         last_operation = self.operations[-1] if self.operations else None
+        _trace(
+            "OperationManager.add before "
+            f"line={operation.line_name} action={operation.action.value} "
+            f"cars={[car.no for car in operation.move_cars]}",
+        )
         if last_operation and last_operation.action == operation.action and last_operation.line_name == operation.line_name:
             last_operation.move_cars.extend(operation.move_cars)
             last_operation.train_cars = operation.train_cars
             last_operation.line_cars_after = operation.line_cars_after
+            _trace(
+                "OperationManager.add merged "
+                f"line={last_operation.line_name} action={last_operation.action.value} "
+                f"cars={[car.no for car in last_operation.move_cars]}",
+            )
             return
         self.operations.append(operation)
         operation.index = len(self.operations)
+        _trace(
+            "OperationManager.add appended "
+            f"index={operation.index} line={operation.line_name} action={operation.action.value} "
+            f"cars={[car.no for car in operation.move_cars]}",
+        )
 
     def print_operations_info(self) -> None:
         for item in self.operations:
@@ -1032,7 +1106,11 @@ class TrackLineManager:
             for car in self.cars.values():
                 if car.target_line.track_line_name == TrackLineName.机走 and car.is_need_move:
                     car.current_line.is_can_arrived = True
-        if line.track_line_name not in {TrackLineName.机走, self.disabled_dedicated_cache_line, self.shared_cache_replacement_line}:
+        if line.track_line_name not in {
+            TrackLineName.机走,
+            self.disabled_dedicated_cache_line,
+            self.shared_cache_replacement_line,
+        }:
             line.is_cache = True
         self._refresh_dynamic_cache_line_state()
 
@@ -1067,35 +1145,34 @@ class TrackLineManager:
         self._refresh_dynamic_cache_line_state()
 
     def _refresh_dynamic_cache_line_state(self) -> None:
-        if self.disabled_dedicated_cache_line.value in self.track_lines:
-            line = self.track_lines[self.disabled_dedicated_cache_line.value]
-            line.is_cache = False
-            line.cache_reserved_capacity = Decimal("0")
-        if self.shared_cache_replacement_line.value in self.track_lines:
-            line = self.track_lines[self.shared_cache_replacement_line.value]
-            line.cache_reserved_capacity = sum(
-                (
-                    car.length
-                    for car in self.cars.values()
-                    if car.is_need_move and car.target_line is line and car.current_line is not line
-                ),
-                Decimal("0"),
-            )
-            has_movable_cars_on_line = any(car.is_need_move for car in line.current_list)
-            line.is_cache = not has_movable_cars_on_line and line.cache_usable_capacity > 0
+        disabled = self.track_lines.get(self.disabled_dedicated_cache_line.value)
+        if disabled is not None:
+            disabled.is_cache = False
+            disabled.cache_reserved_capacity = Decimal("0")
+
+        shared = self.track_lines.get(self.shared_cache_replacement_line.value)
+        if shared is None:
+            return
+
+        shared.cache_reserved_capacity = sum(
+            (
+                car.length
+                for car in self.cars.values()
+                if car.is_need_move and car.target_line is shared and car.current_line is not shared
+            ),
+            Decimal("0"),
+        )
+        has_movable_cars_on_line = any(car.is_need_move for car in shared.current_list)
+        shared.is_cache = not has_movable_cars_on_line and shared.cache_usable_capacity > 0
 
     def _get_emergency_shared_cache_line(self, current_line: TrackLine, cache_car_list: list[Car]) -> TrackLine | None:
-        shared_cache_line = self.track_lines.get(self.shared_cache_replacement_line.value)
-        if shared_cache_line is None:
+        shared = self.track_lines.get(self.shared_cache_replacement_line.value)
+        if shared is None or shared is current_line or not shared.is_can_arrived:
             return None
-        if shared_cache_line is current_line:
+        total_cache_length = sum((car.length for car in cache_car_list), Decimal("0"))
+        if shared.rem_capacity < total_cache_length:
             return None
-        if not shared_cache_line.is_can_arrived:
-            return None
-        total_cache_length = sum(car.length for car in cache_car_list)
-        if shared_cache_line.rem_capacity < total_cache_length:
-            return None
-        return shared_cache_line
+        return shared
 
     def get_track_line(self, track_line_name: TrackLineName) -> TrackLine:
         return self.track_lines[track_line_name.value]
@@ -1143,7 +1220,9 @@ class TrackLineManager:
         if first_car is None:
             raise RuntimeError("没有需要缓存的车辆")
         total_cache_length = sum(car.length for car in cache_car_list)
-        is_shared_cache_target_batch = any(car.target_line.track_line_name == self.shared_cache_replacement_line for car in cache_car_list)
+        is_shared_cache_target_batch = any(
+            car.target_line.track_line_name == self.shared_cache_replacement_line for car in cache_car_list
+        )
 
         if (
             first_car.is_target_line_wanted_continuous
@@ -1202,7 +1281,6 @@ class TrackLineManager:
     GetCacheLine = get_cache_line
     _InitCacheLine = _init_cache_line
     _RefreshDynamicCacheLineState = _refresh_dynamic_cache_line_state
-    _GetEmergencySharedCacheLine = _get_emergency_shared_cache_line
 
 
 class GetCar(TaskItem):
@@ -1557,10 +1635,15 @@ class Weigh(TaskItem):
             need_cache_cars = self.train.current_list[:last_weigh_car_index]
             if need_cache_cars:
                 if cache_line is None:
-                    cache_line = self.track_line_manager.get_cache_line(self.track_line_manager.track_lines[TrackLineName.机库线.value], need_cache_cars, self.car_manager)
+                    cache_line = self.track_line_manager.get_cache_line(
+                        self.track_line_manager.track_lines[TrackLineName.机库线.value],
+                        need_cache_cars,
+                        self.car_manager,
+                    )
                 operation_cache = Operation(line_name=cache_line.name, action=ActionType.PUT)
                 operation_cache.copy_line_cars_before(cache_line)
                 for item in list(need_cache_cars):
+                    # 与 V3 一致：称重前缓存到机走时需要还原目标列表，缓存到其它线则不还原目标列表。
                     Actions.move_car_from_train_to_line(item, self.train, cache_line, cache_line.track_line_name == TrackLineName.机走)
                     operation_cache.move_cars.append(item)
                 operation_cache.copy_line_cars_after(cache_line)
@@ -1582,6 +1665,7 @@ class BackwardConstructionAlgorithm:
     current_put_car_task_priority = 10
 
     def __init__(self, track_lines: dict[str, TrackLine], cars: dict[str, Car], distance_matrix: dict[str, dict[str, int]]) -> None:
+        BackwardConstructionAlgorithm.current_put_car_task_priority = 10
         Constraint.is_put_jz_finished = False
         Constraint.is_put_cun4_finished = False
         self._sort_track_line_cars(track_lines)
@@ -1606,6 +1690,11 @@ class BackwardConstructionAlgorithm:
                 raise RuntimeError("超过100轮未完成")
             round_idx += 1
             task_list = self.task_manager.get_ready_tasks()
+            _trace(
+                "ready_tasks="
+                + str([(task.id, task.priority, self.task_manager.get_task_status(task.id).name) for task in task_list]),
+                round_idx,
+            )
             is_contain_completed = False
             force_skip_other_task = False
             for task in task_list:
@@ -1628,6 +1717,12 @@ class BackwardConstructionAlgorithm:
                         item.is_can_arrived = True
                     continue
                 raise RuntimeError("未取到车辆，程序异常终止")
+            _trace(
+                "selected_target="
+                f"{target.no}@{target.current_line_name}:{target.current_depth}"
+                f"->{target.target_line_name}:{target.target_line_position}",
+                round_idx,
+            )
             self._move_car(target, self.train, self.operation_manager)
         return self.operation_manager.operations
 
@@ -1654,9 +1749,25 @@ class BackwardConstructionAlgorithm:
 
     def _create_put_task(self, line: TrackLine, dependencies: Iterable[str] | None = None) -> None:
         if line.track_line_name == TrackLineName.机走:
-            task: TaskItem = PutCarToJZLine(self.track_line_manager, self.train, self.operation_manager, self.task_manager, self.car_manager, priority=self.current_put_car_task_priority)
+            task: TaskItem = PutCarToJZLine(
+                self.track_line_manager,
+                self.train,
+                self.operation_manager,
+                self.task_manager,
+                self.car_manager,
+                priority=BackwardConstructionAlgorithm.current_put_car_task_priority,
+            )
         else:
-            task = PutCar(self.task_manager, line.track_line_name, self.track_line_manager, self.train, self.car_manager, self.operation_manager, priority=self.current_put_car_task_priority, dependencies=dependencies)
+            task = PutCar(
+                self.task_manager,
+                line.track_line_name,
+                self.track_line_manager,
+                self.train,
+                self.car_manager,
+                self.operation_manager,
+                priority=BackwardConstructionAlgorithm.current_put_car_task_priority,
+                dependencies=dependencies,
+            )
         BackwardConstructionAlgorithm.current_put_car_task_priority += 1
         self.task_manager.add_task(task)
 
@@ -1721,12 +1832,35 @@ class BackwardConstructionAlgorithm:
 
     def _get_best_target(self, track_lines: dict[str, TrackLine], train: Train) -> Car | None:
         if train.wanted_car and train.wanted_car.is_current_top_and_can_get_direct:
+            _trace(
+                "best_target shortcut train.wanted_car="
+                f"{train.wanted_car.no}@{train.wanted_car.current_line_name}",
+            )
             return train.wanted_car
         candidates = [
             line.target_top_car
             for line in track_lines.values()
             if line.target_top_car is not None and not line.target_top_car.is_in_train and line.target_top_car.current_line.is_can_arrived
         ]
+        if train.current_list_count == 0:
+            non_closed_door_candidates = [
+                car for car in candidates if not (car.is_closed_door and car.target_line.track_line_name != TrackLineName.存4线)
+            ]
+            if non_closed_door_candidates:
+                candidates = non_closed_door_candidates
+        _trace(
+            "best_target candidates="
+            + str([
+                (
+                    car.no,
+                    car.current_line_name,
+                    car.current_depth,
+                    car.target_line_name,
+                    car.target_line.priority,
+                )
+                for car in candidates
+            ]),
+        )
         task = self.task_manager.get_task(f"Put_{TrackLineName.机走.value}")
         if task is not None and self.task_manager.get_task_status(task.id) != TaskStatus.COMPLETED:
             candidates = [car for car in candidates if car.current_line.track_line_name != TrackLineName.机走]
@@ -1749,6 +1883,12 @@ class BackwardConstructionAlgorithm:
         current_line = car.current_line
         continuous_cars = car.continuous_cars
         block_cars = car.current_line.current_list[: car.current_depth]
+        _trace(
+            "_move_car "
+            f"target={car.no} line={car.current_line_name} depth={car.current_depth} "
+            f"continuous={[item.no for item in continuous_cars]} "
+            f"block={[item.no for item in block_cars]}",
+        )
         if Constraint.is_over_train_count_limit(self.train, continuous_cars) or Constraint.is_over_train_count_limit(self.train, block_cars):
             task = self.task_manager.get_task(f"Put_{TrackLineName.机走.value}")
             if task is None:
