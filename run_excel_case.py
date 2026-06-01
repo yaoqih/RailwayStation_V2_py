@@ -17,27 +17,53 @@ def apply_csharp_export_postprocess(operations):
     return normalized
 
 
-def car_to_payload(car):
-    return {
+def _serialize_decimal(value):
+    try:
+        integral = value.to_integral_value()
+        if value == integral:
+            return int(integral)
+    except AttributeError:
+        pass
+    return float(value)
+
+
+def car_to_payload(car, include_debug_fields=False):
+    payload = {
         "No": car.no,
         "Type": car.type,
+        "Length": _serialize_decimal(car.length),
+        "CurrentLineId": car.current_line_id,
+        "CurrentLineName": car.current_line_name,
         "OriginLineName": car.origin_line_name,
         "OriginLineName_Second": car.origin_line_name_second,
         "OriginLinePosition": car.origin_line_position,
+        "PossibleTargetLineNames": list(car.possible_target_line_names),
+        "TargetMinPosition": car.target_min_position,
+        "TargetMaxPosition": car.target_max_position,
+        "TargetLineId": car.target_line_id,
         "TargetLineName": car.target_line_name,
         "TargetLineName_Second": car.target_line_name_second,
         "TargetLinePosition": car.target_line_position,
-        "CurrentLineName": car.current_line_name,
-        "CurrentDepth": car.current_depth,
-        "IsHeavy": car.is_heavy,
-        "IsWeigh": car.is_weigh,
-        "IsWeighed": car.is_weighed,
         "IsForceTargetPosition": car.is_force_target_position,
         "FixedTargetLinePosition": car.fixed_target_line_position,
+        "ForceTargetPositionText": car.force_target_position_text,
+        "AllowedTargetLinePositions": list(car.allowed_target_line_positions),
+        "IsClosedDoor": car.is_closed_door,
+        "IsHeavy": car.is_heavy,
+        "IsWeigh": car.is_weigh,
+        "RemainOriginTargetCars": [],
     }
+    if include_debug_fields:
+        payload["CurrentDepth"] = car.current_depth
+        payload["IsWeighed"] = car.is_weighed
+    payload["RemainOriginTargetCars"] = [
+        car_to_payload(item, include_debug_fields=include_debug_fields)
+        for item in car.remain_origin_target_cars
+    ]
+    return payload
 
 
-def build_result_payload(operations):
+def build_result_payload(operations, include_debug_fields=False):
     return [
         {
             "Index": op.index,
@@ -47,10 +73,10 @@ def build_result_payload(operations):
             "TrainCarsCount": op.train_cars_count,
             "LineCarsBeforCount": op.line_cars_befor_count,
             "LineCarsAfterCount": op.line_cars_after_count,
-            "MoveCars": [car_to_payload(car) for car in op.move_cars],
-            "TrainCars": [car_to_payload(car) for car in op.train_cars],
-            "LineCarsBefore": [car_to_payload(car) for car in op.line_cars_before],
-            "LineCarsAfter": [car_to_payload(car) for car in op.line_cars_after],
+            "MoveCars": [car_to_payload(car, include_debug_fields=include_debug_fields) for car in op.move_cars],
+            "TrainCars": [car_to_payload(car, include_debug_fields=include_debug_fields) for car in op.train_cars],
+            "LineCarsBefore": [car_to_payload(car, include_debug_fields=include_debug_fields) for car in op.line_cars_before],
+            "LineCarsAfter": [car_to_payload(car, include_debug_fields=include_debug_fields) for car in op.line_cars_after],
         }
         for op in operations
     ]
@@ -88,6 +114,12 @@ def main() -> None:
         default=False,
         help="Apply legacy export-side reverse logic. Disabled by default because RailwayStation_V2 parity should preserve the raw operation order; use --apply-csharp-export-postprocess only when you explicitly need the older reversed export format.",
     )
+    parser.add_argument(
+        "--include-debug-fields",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Include non-C#-serialized debug fields such as CurrentDepth and IsWeighed.",
+    )
     args = parser.parse_args()
 
     case_path = args.file.resolve()
@@ -104,7 +136,7 @@ def main() -> None:
         operations = apply_csharp_export_postprocess(operations)
 
     output_path.write_text(
-        json.dumps(build_result_payload(operations), ensure_ascii=False, indent=2),
+        json.dumps(build_result_payload(operations, include_debug_fields=args.include_debug_fields), ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
     print(f"operations={len(operations)}")
