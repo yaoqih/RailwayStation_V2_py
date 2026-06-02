@@ -98,8 +98,11 @@ def resolve_working_case_path(case_path: Path, prepare_terminal: bool) -> Path:
     if has_end_generated:
         return case_path
 
-    Terminal.generate_end_sheet(str(case_path))
-    return StandardCaseConverter.convert_case(str(case_path))
+    raise RuntimeError(
+        "输入文件缺少 End_generated sheet。"
+        "当前默认严格使用外部现成终点以对齐 C# direct_solver_only；"
+        "如果你要先生成终点再求解，请显式传入 --prepare-terminal。"
+    )
 
 
 def main() -> None:
@@ -107,7 +110,11 @@ def main() -> None:
     parser.add_argument("--file", required=True, type=Path, help="Case xlsx path.")
     parser.add_argument("--map", required=True, type=Path, help="map.xlsx path.")
     parser.add_argument("--output", required=True, type=Path, help="Output json path.")
-    parser.add_argument("--prepare-terminal", action="store_true", help="Generate Start_with_end and End_generated before solving.")
+    parser.add_argument(
+        "--prepare-terminal",
+        action="store_true",
+        help="Generate Start_with_end and End_generated before solving. Disabled by default so the solver uses the workbook's existing End_generated and stays aligned with C# direct_solver_only.",
+    )
     parser.add_argument(
         "--apply-csharp-export-postprocess",
         action=argparse.BooleanOptionalAction,
