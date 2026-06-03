@@ -100,6 +100,18 @@ TRACE_ROUNDS = {
     for item in os.environ.get("RAILWAY_TRACE_ROUNDS", "").split(",")
     if item.strip().isdigit()
 }
+INT32_MAX = 2**31 - 1
+
+
+def _to_int32(value: int) -> int:
+    value &= 0xFFFFFFFF
+    if value >= 0x80000000:
+        value -= 0x100000000
+    return value
+
+
+def _int32_add(left: int, right: int) -> int:
+    return _to_int32(left + right)
 
 
 def _trace_enabled(round_idx: int | None = None) -> bool:
@@ -747,8 +759,10 @@ class Actions:
         if last_target and train.current_top_car.is_target_line_wanted_continuous:
             task = task_manager.get_task(f"Put_{last_target.track_line_name.value}")
             if task:
-                task.priority = BackwardConstructionAlgorithm.current_put_car_task_priority
-                BackwardConstructionAlgorithm.current_put_car_task_priority += 1
+                task.priority = _to_int32(BackwardConstructionAlgorithm.current_put_car_task_priority)
+                BackwardConstructionAlgorithm.current_put_car_task_priority = _int32_add(
+                    BackwardConstructionAlgorithm.current_put_car_task_priority, 1
+                )
 
     @staticmethod
     def is_can_cache_in_jzyx(track_line_name: TrackLineName) -> bool:
@@ -788,12 +802,27 @@ class TaskManager:
         self.on_task_completed: list[Callable[[TaskItem], None]] = []
         self._tasks: dict[str, TaskItem] = {}
         self._task_status: dict[str, TaskStatus] = {}
+        self._task_slot: dict[str, int] = {}
+        self._next_slot = 0
+        self._free_slots: list[int] = []
 
     def add_task(self, task: TaskItem) -> None:
+        existed = task.id in self._tasks
+        if not existed and task.id not in self._task_slot:
+            if self._free_slots:
+                self._task_slot[task.id] = self._free_slots.pop()
+            else:
+                self._task_slot[task.id] = self._next_slot
+                self._next_slot += 1
         if task.id in self._tasks:
             task.priority = max(self._tasks[task.id].priority, task.priority)
         self._tasks[task.id] = task
         self._task_status[task.id] = TaskStatus.NOT_STARTED
+        _trace(
+            "add_task="
+            f"{task.id} priority={task.priority} existed={existed} "
+            f"slot={self._task_slot.get(task.id)} deps={sorted(task.dependencies)}"
+        )
 
     def get_all_task_ids(self) -> list[str]:
         return list(self._tasks.keys())
@@ -809,7 +838,7 @@ class TaskManager:
                 continue
             if status in {TaskStatus.NOT_STARTED, TaskStatus.RUNNING, TaskStatus.SKIPPED}:
                 ready.append((task, status))
-        ready.sort(key=lambda item: (item[1].value, -item[0].priority))
+        ready.sort(key=lambda item: (item[1].value, -item[0].priority, self._task_slot.get(item[0].id, 0)))
         return [task for task, _ in ready]
 
     def set_task_status(self, task_id: str, status: TaskStatus) -> None:
@@ -845,6 +874,14 @@ class TaskManager:
     PauseAllTasks = pause_all_tasks
     ResumeAllTasks = resume_all_tasks
 
+    def _remove_task(self, task_id: str) -> None:
+        if task_id in self._tasks:
+            slot = self._task_slot.pop(task_id, None)
+            if slot is not None:
+                self._free_slots.append(slot)
+            self._tasks.pop(task_id, None)
+            self._task_status.pop(task_id, None)
+
 
 class BCTaskManager(TaskManager):
     def reset_all_task_priority_to_zero(self) -> None:
@@ -854,14 +891,12 @@ class BCTaskManager(TaskManager):
     def remove_tasks_except_put(self) -> None:
         keys = [key for key in self._tasks if not key.startswith("Put_")]
         for key in keys:
-            self._tasks.pop(key, None)
-            self._task_status.pop(key, None)
+            self._remove_task(key)
 
     def remove_get_tasks(self) -> None:
         keys = [key for key in self._tasks if key.startswith("Get_")]
         for key in keys:
-            self._tasks.pop(key, None)
-            self._task_status.pop(key, None)
+            self._remove_task(key)
 
     def create_clear_line_task(self, cache_line: TrackLine, track_line_manager: "TrackLineManager", train: Train) -> None:
         task_id = f"Clear_{cache_line.track_line_name.value}"
@@ -1293,7 +1328,7 @@ class GetCar(TaskItem):
         line = self.track_manager.get_track_line(self.track_line_name)
         if line.target_top_car is None:
             return TaskStatus.COMPLETED, False
-        line.priority += self.priority
+        line.priority = _int32_add(line.priority, self.priority)
         return TaskStatus.RUNNING, False
 
     Execute = execute
@@ -1323,7 +1358,7 @@ class ClearLine(TaskItem):
                 if item.target_line not in target_lines:
                     target_lines.append(item.target_line)
             for item in target_lines:
-                item.priority = min((2**31 - 1), item.priority + self.priority)
+                item.priority = INT32_MAX if item.priority == INT32_MAX else _int32_add(item.priority, self.priority)
             return TaskStatus.RUNNING, False
         if self.can_skip:
             return TaskStatus.SKIPPED, False
@@ -1395,7 +1430,7 @@ class PutCar(TaskItem):
             if task is None:
                 task = GetCar(target_line.track_line_name, self.track_line_manager, can_skip=True)
                 self.task_manager.add_task(task)
-            task.priority += 1
+            task.priority = _int32_add(task.priority, 1)
             return True, False
         return False, False
 
@@ -1558,10 +1593,18 @@ class PutCarToJZLine(TaskItem):
                 if not operation.line_cars_before:
                     operation.copy_line_cars_before(cache_line)
                 current_type = "Cache"
-            for put_car in cars:
-                Actions.move_car_from_train_to_line(put_car, self.train, destination, True)
-            if current_type == "Cache" and self.train.wanted_car and self.train.wanted_car.is_current_top_and_can_get_direct:
-                is_break = True
+                # 与当前 C# 源码保持一致：
+                # 一旦缓存后出现“车头上有可直接取的 wanted car”，
+                # C# 会立刻 break，导致这批刚缓存的车没有被记入当前操作记录。
+                # 这是现有源码行为的一部分，Python 这里也必须保持相同。
+                for put_car in cars:
+                    Actions.move_car_from_train_to_line(put_car, self.train, destination, True)
+                if self.train.wanted_car and self.train.wanted_car.is_current_top_and_can_get_direct:
+                    is_break = True
+                    break
+            if current_type == "Put":
+                for put_car in cars:
+                    Actions.move_car_from_train_to_line(put_car, self.train, destination, True)
             if last_type != "Init" and current_type != last_type:
                 operation.copy_train_cars(self.train)
                 operation.copy_line_cars_after(self.track_line_manager.track_lines[operation.line_name])
@@ -1698,7 +1741,19 @@ class BackwardConstructionAlgorithm:
             is_contain_completed = False
             force_skip_other_task = False
             for task in task_list:
+                _trace(
+                    "execute_task="
+                    f"{task.id} priority={task.priority} "
+                    f"status_before={self.task_manager.get_task_status(task.id).name}",
+                    round_idx,
+                )
                 status, force_skip_other_task = task.execute()
+                _trace(
+                    "task_result="
+                    f"{task.id} status_after={status.name} "
+                    f"force_skip={force_skip_other_task}",
+                    round_idx,
+                )
                 self.task_manager.set_task_status(task.id, status)
                 if force_skip_other_task:
                     break
@@ -1768,7 +1823,9 @@ class BackwardConstructionAlgorithm:
                 priority=BackwardConstructionAlgorithm.current_put_car_task_priority,
                 dependencies=dependencies,
             )
-        BackwardConstructionAlgorithm.current_put_car_task_priority += 1
+        BackwardConstructionAlgorithm.current_put_car_task_priority = _int32_add(
+            BackwardConstructionAlgorithm.current_put_car_task_priority, 1
+        )
         self.task_manager.add_task(task)
 
     def on_task_completed(self, task: TaskItem) -> None:
@@ -1809,7 +1866,9 @@ class BackwardConstructionAlgorithm:
         for target_line, is_all_contain in target_is_all_contain:
             if is_all_contain and target_line.is_cleared:
                 put_task = PutCar(self.task_manager, target_line.track_line_name, self.track_line_manager, self.train, self.car_manager, self.operation_manager, BackwardConstructionAlgorithm.current_put_car_task_priority)
-                BackwardConstructionAlgorithm.current_put_car_task_priority += 1
+                BackwardConstructionAlgorithm.current_put_car_task_priority = _int32_add(
+                    BackwardConstructionAlgorithm.current_put_car_task_priority, 1
+                )
                 self.task_manager.add_task(put_task)
 
     def _init_task(self) -> None:
@@ -1831,6 +1890,11 @@ class BackwardConstructionAlgorithm:
             self.task_manager.add_task(Weigh(self.train, self.task_manager, self.car_manager, self.track_line_manager, self.operation_manager))
 
     def _get_best_target(self, track_lines: dict[str, TrackLine], train: Train) -> Car | None:
+        _trace(
+            "best_target context "
+            f"train_top={(train.current_top_car.no if train.current_top_car else None)} "
+            f"wanted={(train.wanted_car.no if train.wanted_car else None)}"
+        )
         if train.wanted_car and train.wanted_car.is_current_top_and_can_get_direct:
             _trace(
                 "best_target shortcut train.wanted_car="
@@ -1893,7 +1957,9 @@ class BackwardConstructionAlgorithm:
             task = self.task_manager.get_task(f"Put_{TrackLineName.机走.value}")
             if task is None:
                 task = PutCarToJZLine(self.track_line_manager, self.train, operation_manager, self.task_manager, self.car_manager, priority=BackwardConstructionAlgorithm.current_put_car_task_priority)
-                BackwardConstructionAlgorithm.current_put_car_task_priority += 1
+                BackwardConstructionAlgorithm.current_put_car_task_priority = _int32_add(
+                    BackwardConstructionAlgorithm.current_put_car_task_priority, 1
+                )
                 self.task_manager.add_task(task)
                 return
             if continuous_cars:
